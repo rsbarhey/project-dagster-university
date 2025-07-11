@@ -8,7 +8,8 @@ import pandas as pd
 import os
 
 from dagster_essentials.defs.assets import constants
-from dagster._utils.backoff import backoff
+from dagster_essentials.defs.partitions import weekly_partition
+
 from datetime import datetime, timedelta
 from dagster_duckdb import DuckDBResource
 
@@ -57,10 +58,13 @@ def manhattan_map() -> None:
 
 
 @dg.asset(
-    deps=["taxi_trips"]
+    deps=["taxi_trips"],
+    partitions_def=weekly_partition
 )
-def trips_by_week(database: DuckDBResource) -> None:
-    query = """
+def trips_by_week(context: dg.AssetExecutionContext, database: DuckDBResource) -> None:
+    
+    period_to_process = context.partition_key
+    query = f"""
             SELECT 
                 date_trunc('week', pickup_datetime) AS period,
                 COUNT(1) AS num_trips,
@@ -68,52 +72,57 @@ def trips_by_week(database: DuckDBResource) -> None:
                 sum(total_amount) AS total_amount,
                 sum(trip_distance) AS trip_distance
             from trips
-            WHERE date_trunc('month',pickup_datetime) = DATE '2023-03-01'
+            WHERE pickup_datetime >= '{period_to_process}'::date
+            and pickup_datetime < '{period_to_process}'::date + interval '1 week'
             GROUP BY date_trunc('week', pickup_datetime)
     """
     with database.get_connection() as conn:
         trips_by_week = conn.execute(query).fetch_df()
-    trips_by_week.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index= 0)
+    fileName = constants.TRIPS_BY_WEEK_FILE_PATH[:-4] + period_to_process + ".csv"
+    trips_by_week.to_csv(fileName, index= 0)
 
 @dg.asset(
-    deps=["taxi_trips"]
+    deps=["taxi_trips"],
+    partitions_def=weekly_partition
 )
-def trips_by_week_tut(database: DuckDBResource) -> None:
-    current_date = datetime.strptime("2023-03-01", constants.DATE_FORMAT)
-    end_date = datetime.strptime("2023-04-01", constants.DATE_FORMAT)
+def trips_by_week_tut(context: dg.AssetExecutionContext, database: DuckDBResource) -> None:
+    """
+      The number of trips per week, aggregated by week.
+    """
 
-    result = pd.DataFrame()
+    period_to_fetch = context.partition_key
 
-    while current_date < end_date:
-        current_date_str = current_date.strftime(constants.DATE_FORMAT)
-        query = f"""
-            select
-                vendor_id, total_amount, trip_distance, passenger_count
-            from trips
-            where date_trunc('week', pickup_datetime) = date_trunc('week', '{current_date_str}'::date)
-        """
-        with database.get_connection() as conn:
-            data_for_week = conn.execute(query).fetch_df()
+    # get all trips for the week
+    query = f"""
+        select vendor_id, total_amount, trip_distance, passenger_count
+        from trips
+        where pickup_datetime >= '{period_to_fetch}'
+            and pickup_datetime < '{period_to_fetch}'::date + interval '1 week'
+    """
 
-        aggregate = data_for_week.agg({
-            "vendor_id": "count",
-            "total_amount": "sum",
-            "trip_distance": "sum",
-            "passenger_count": "sum"
-        }).rename({"vendor_id": "num_trips"}).to_frame().T # type: ignore
+    with database.get_connection() as conn:
+        data_for_month = conn.execute(query).fetch_df()
 
-        aggregate["period"] = current_date
-
-        result = pd.concat([result, aggregate])
-
-        current_date += timedelta(days=7)
+    aggregate = data_for_month.agg({
+        "vendor_id": "count",
+        "total_amount": "sum",
+        "trip_distance": "sum",
+        "passenger_count": "sum"
+    }).rename({"vendor_id": "num_trips"}).to_frame().T # type: ignore
 
     # clean up the formatting of the dataframe
-    result['num_trips'] = result['num_trips'].astype(int)
-    result['passenger_count'] = result['passenger_count'].astype(int)
-    result['total_amount'] = result['total_amount'].round(2).astype(float)
-    result['trip_distance'] = result['trip_distance'].round(2).astype(float)
-    result = result[["period", "num_trips", "total_amount", "trip_distance", "passenger_count"]]
-    result = result.sort_values(by="period")
+    aggregate["period"] = period_to_fetch
+    aggregate['num_trips'] = aggregate['num_trips'].astype(int)
+    aggregate['passenger_count'] = aggregate['passenger_count'].astype(int)
+    aggregate['total_amount'] = aggregate['total_amount'].round(2).astype(float)
+    aggregate['trip_distance'] = aggregate['trip_distance'].round(2).astype(float)
+    aggregate = aggregate[["period", "num_trips", "total_amount", "trip_distance", "passenger_count"]]
 
-    result.to_csv("data/outputs/trips_by_week_tut.csv", index=False)
+    try:
+        # If the file already exists, append to it, but replace the existing month's data
+        existing = pd.read_csv("data/outputs/trips_by_week_tut.csv")
+        existing = existing[existing["period"] != period_to_fetch]
+        existing = pd.concat([existing, aggregate]).sort_values(by="period")
+        existing.to_csv("data/outputs/trips_by_week_tut.csv", index=False)
+    except FileNotFoundError:
+        aggregate.to_csv("data/outputs/trips_by_week_tut.csv", index=False)
